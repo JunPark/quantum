@@ -309,6 +309,16 @@ def set_port_status(port_id, status):
     except exc.NoResultFound:
         raise q_exc.PortNotFound(port_id=port_id)
 
+def set_port_status_device_null(port_id, status):
+    session = db.get_session()
+    try:
+        port = session.query(models_v2.Port).filter_by(id=port_id).one()
+        port['status'] = status
+        port['device_id'] = ''
+        session.merge(port)
+        session.flush()
+    except exc.NoResultFound:
+        raise q_exc.PortNotFound(port_id=port_id)
 
 def get_tunnel_endpoints():
     session = db.get_session()

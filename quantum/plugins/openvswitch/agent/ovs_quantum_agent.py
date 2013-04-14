@@ -97,7 +97,6 @@ class Port(object):
     def __hash__(self):
         return hash(self.id)
 
-
 class OVSQuantumAgent(object):
     '''Implements OVS-based tunneling, VLANs and flat networks.
 
@@ -136,19 +135,21 @@ class OVSQuantumAgent(object):
 
     def __init__(self, integ_br, tun_br, local_ip,
                  bridge_mappings, root_helper,
-                 polling_interval, reconnect_interval, rpc, enable_tunneling):
+                 polling_interval, reconnect_interval, rpc,
+                 enable_tunneling, metadata_server_ip, br_mtu):
         '''Constructor.
 
         :param integ_br: name of the integration bridge.
         :param tun_br: name of the tunnel bridge.
         :param local_ip: local IP address of this hypervisor.
-        :param bridge_mappings: mappings from physical network name to bridge.
+        :param bridge_mappings: mappings from phyiscal interface to bridge.
         :param root_helper: utility to use when running shell cmds.
         :param polling_interval: interval (secs) to poll DB.
         :param reconnect_internal: retry interval (secs) on DB error.
         :param rpc: if True use RPC interface to interface with plugin.
         :param enable_tunneling: if True enable GRE networks.
         '''
+        self.br_mtu = br_mtu
         self.root_helper = root_helper
         self.available_local_vlans = set(
             xrange(OVSQuantumAgent.MIN_VLAN_TAG,
@@ -156,6 +157,7 @@ class OVSQuantumAgent(object):
         self.setup_integration_br(integ_br)
         self.setup_physical_bridges(bridge_mappings)
         self.local_vlan_map = {}
+        self.vps_vlan_map = {}
 
         self.polling_interval = polling_interval
         self.reconnect_interval = reconnect_interval
@@ -163,6 +165,8 @@ class OVSQuantumAgent(object):
         self.enable_tunneling = enable_tunneling
         self.local_ip = local_ip
         self.tunnel_count = 0
+        self.metadata_server_ip = metadata_server_ip
+
         if self.enable_tunneling:
             self.setup_tunnel_br(tun_br)
 
@@ -235,6 +239,405 @@ class OVSQuantumAgent(object):
         '''
         return dispatcher.RpcDispatcher([self])
 
+    def add_flows_metadata_service(self, net_uuid, physical_network, lvid):
+        '''
+        For metadata service: BH Hack
+        '''
+        br = self.phys_brs[physical_network]
+
+        # priority=7,ip,in_port=21,dl_vlan=1,nw_dst=169.254.169.254
+        # actions=strip_vlan,mod_nw_dst:10.2.7.11,mod_tp_dst:8775,NORMAL
+        br.add_flow(priority=7,
+                    in_port=self.phys_ofports[physical_network],
+                    dl_vlan=lvid,
+                    nw_dst="169.254.169.254",
+                    actions="strip_vlan,mod_nw_dst:%s,"
+                             "mod_tp_dst:8775,normal" %
+                             self.metadata_server_ip)
+
+        # inbound at br-int
+        # priority=7,ip,in_port=37,nw_src=10.2.7.11
+        # actions=mod_nw_src:169.254.169.254,mod_tp_src:80,mod_vlan_vid:1,
+        # NORMAL
+        self.int_br.add_flow(priority=7,
+                             in_port=
+                             self.int_ofports[physical_network],
+                             nw_src=self.metadata_server_ip,
+                             tp_src=8775,
+                             actions="mod_nw_src:169.254.169.254,"
+                                      "mod_tp_src:80,mod_vlan_vid:%d,normal"
+                                      % lvid)
+
+
+    def add_flows_anti_spoofing(self, net_uuid, physical_network, lvid,
+                                ip_list, cidr_list):
+
+        iplist = ip_list.split(',')
+        cidrlist = cidr_list.split(',')
+        br = self.phys_brs[physical_network]
+
+        for ip, cidr in map(None, iplist, cidrlist):
+            ip = ip.strip('\'')
+            cidr = cidr.strip('\'')
+
+            # priority=7,ip,in_port=21,dl_vlan=1,nw_dst=169.254.169.254
+            # actions=strip_vlan,mod_nw_dst:10.2.7.11,mod_tp_dst:8775,NORMAL
+            br.add_flow(priority=17,
+                        in_port=self.phys_ofports[physical_network],
+                        dl_vlan=lvid,
+                        nw_src=ip,
+                        actions="strip_vlan,normal")
+            br.add_flow(priority=14,
+                        proto='arp',
+                        in_port=self.phys_ofports[physical_network],
+                        dl_vlan=lvid,
+                        nw_src=ip,
+                        actions="strip_vlan,normal")
+
+            br.add_flow(priority=10,
+                        in_port=self.phys_ofports[physical_network],
+                        dl_vlan=lvid,
+                        nw_src=cidr,
+                        actions="drop")
+            br.add_flow(priority=9,
+                        proto='arp',
+                        in_port=self.phys_ofports[physical_network],
+                        dl_vlan=lvid,
+                        nw_src=cidr,
+                        actions="drop")
+
+    def update_flat_port_org(self, net_uuid, physical_network, lvid, port):
+        '''Updates a port in flat networks.
+
+        :param net_uuid: the uuid of the network associated with this vlan.
+        :param physical_network: only for 'flat' for now.
+        :param lvid: VLAN ID
+        '''
+
+        LOG.debug("update_flat_port():net_uuud:%s, physical_net:%s",
+                    net_uuid, physical_network)
+
+        ip_list = port.ip_list
+        cidr_list = port.cidr_list
+        vif_mac = port.vif_mac
+        port_name = port.port_name
+        ofport = port.ofport
+
+        if physical_network in self.phys_brs:
+            # outbound
+            br = self.phys_brs[physical_network]
+            br.delete_flows(in_port=self.phys_ofports[physical_network],
+                        dl_vlan=lvid)
+            # priority=5,in_port=21,dl_vlan=1 actions=strip_vlan,NORMAL
+            br.add_flow(priority=5,
+                        in_port=self.phys_ofports[physical_network],
+                        dl_vlan=lvid,
+                        actions="strip_vlan,normal")
+
+            # inbound
+            # priority=4,in_port=37,vlan_tci=0x0000 actions=mod_vlan_vid:1,
+            # NORMAL
+            self.int_br.add_flow(priority=4,
+                                 in_port=
+                                 self.int_ofports[physical_network],
+                                 dl_vlan=0xffff,
+                                 actions="mod_vlan_vid:%s,normal" % lvid)
+
+    def deploy_BH_ovs_flows(self, net_uuid, physical_network, port,
+                             changed_port):
+        '''Updates a port in flat networks.
+
+        :param net_uuid: the uuid of the network associated with this vlan.
+        :param physical_network: only for 'flat' for now.
+        '''
+
+        LOG.debug("deploy_BH_ovs_flows():net_uuud:%s, physical_net:%s",
+                    net_uuid, physical_network)
+
+        removed_ip_list = []
+        removed_cidr_list = []
+        added_ip_list = []
+        added_cidr_list = []
+        match_ip_list = []
+        match_cidr_list = []
+
+        # Here a 'changed_port' port is either
+        # 1. Updated port (i.e., IPs are added or removed, or both)  or
+        # 2. New port with new IPs.
+        # "Removed" ports will be handled in a different place.
+
+        prev_ip_list = sorted(changed_port[0]['ip_list'].split(',')) \
+                       if changed_port[0] is not None else []
+        cur_ip_list = sorted(changed_port[1]['ip_list'].split(','))
+        prev_cidr_list = sorted(changed_port[0]['cidr_list'].split(',')) \
+                         if changed_port[0] is not None else []
+        cur_cidr_list = sorted(changed_port[1]['cidr_list'].split(','))
+        j = 0
+        for i in xrange(len(prev_ip_list)):
+            if prev_ip_list[i] != cur_ip_list[j]:
+                removed_ip_list.append(prev_ip_list[i])
+                removed_cidr_list.append(prev_cidr_list[i])
+                continue
+            else:
+                match_ip_list.append(prev_ip_list[i])
+                match_cidr_list.append(prev_cidr_list[i])
+                j += 1
+        for t in xrange(j, len(cur_ip_list)):
+            added_ip_list.append(cur_ip_list[t])
+            added_cidr_list.append(cur_cidr_list[t])
+
+        vif_mac = port.vif_mac
+        port_name = port.port_name
+        ofport = port.ofport
+
+        if physical_network in self.phys_brs:
+            br = self.phys_brs[physical_network]
+            br.add_flow(priority=40,
+                        in_port=self.physical_network_ofport,
+                        actions="output:%s" %
+                        self.phys_ofports[physical_network])
+            if vif_mac is not None:
+                # Incoming from outside: Destination-MAC
+                self.int_br.add_flow(priority=40,
+                                 in_port=
+                                 self.int_ofports[physical_network],
+                                 dl_vlan=0xffff,
+                                 dl_dst=vif_mac,
+                                 actions="output:%s" % ofport)
+
+                # Internal from loopback: Destination-MAC
+                self.int_br.add_flow(priority=20,
+                                 in_port=
+                                 self.int_loopback_ofports[physical_network],
+                                 dl_vlan=0xffff,
+                                 dl_dst=vif_mac,
+                                 actions="output:%s" % ofport)
+
+                # Outgoing from port, passing to the other paired bridge on phy
+                self.int_br.add_flow(priority=40,
+                                 in_port=ofport,
+                                 dl_vlan=0xffff,
+                                 actions="output:%s" %
+                                 self.int_ofports[physical_network])
+
+                # Clean up ARP query flows first
+                for ip in removed_ip_list:
+                    self.int_br.delete_flows(
+                                     in_port=
+                                     self.int_ofports[physical_network],
+                                     proto='arp',
+                                     nw_dst=ip,
+                                     dl_dst=
+                                     "01:00:00:00:00:00/01:00:00:00:00:00")
+                    self.int_br.delete_flows(
+                                     in_port=
+                                     self.int_loopback_ofports[physical_network],
+                                     proto='arp',
+                                     nw_dst=ip,
+                                     dl_dst=
+                                     "01:00:00:00:00:00/01:00:00:00:00:00")
+                    # Delete previously legitimate IP packets
+                    self.int_br.delete_flows(
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=ip)
+                    # Delete previously legitimate ARP response
+                    self.int_br.delete_flows(
+                                proto='arp',
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=ip)
+
+                # ARP query: Broadcast & Destination IP of this port
+                for ip in added_ip_list:
+                    self.int_br.add_flow(priority=40,
+                                    in_port=
+                                    self.int_ofports[physical_network],
+                                    proto='arp',
+                                    nw_dst=ip,
+                                    dl_dst=
+                                    "01:00:00:00:00:00/01:00:00:00:00:00",
+                                    actions="output:%s" % ofport)
+                    self.int_br.add_flow(priority=40,
+                                    in_port=
+                                    self.int_loopback_ofports[physical_network],
+                                    proto='arp',
+                                    nw_dst=ip,
+                                    dl_dst=
+                                    "01:00:00:00:00:00/01:00:00:00:00:00",
+                                    actions="output:%s" % ofport)
+
+                # Clean up first
+                for ip, cidr in map(None, removed_ip_list, removed_cidr_list):
+                    br.delete_flows(in_port=self.phys_ofports[physical_network],
+                                nw_src=ip)
+                    br.delete_flows(proto='arp',
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=ip)
+                    br.delete_flows(in_port=self.phys_ofports[physical_network],
+                                proto='arp',
+                                nw_dst=ip,
+                                dl_dst="01:00:00:00:00:00/01:00:00:00:00:00")
+
+                    # There is a bug in OVS in deleting cidr-based flows.
+                    # BUG: Deleting a cidr flow results in deleting all flows.
+                    # For now, just leave undesired cidr-based OVS flows.
+                    # Since with only several subnets, we end up keeping
+                    # Only a few OVS flows.
+                    #
+                    #br.delete_flows(in_port=self.phys_ofports[physical_network],
+                    #            nw_src=cidr)
+                    #br.delete_flows(proto='arp',
+                    #            in_port=self.phys_ofports[physical_network],
+                    #            nw_src=cidr)
+
+
+                # Anti_IP_spoofing
+                for ip, cidr in map(None, added_ip_list, added_cidr_list):
+
+                    # For physical bridge
+                    # Internal: ARP query packets
+                    br.add_flow(priority=40,
+                                in_port=self.phys_ofports[physical_network],
+                                proto='arp',
+                                nw_dst=ip,
+                                dl_dst="01:00:00:00:00:00/01:00:00:00:00:00",
+                                actions="output:%s" %
+                                self.phys_loopback_ofports[physical_network])
+                    # Internal: Destination-MAC for internal traffic
+                    br.add_flow(priority=30,
+                                in_port=self.phys_ofports[physical_network],
+                                dl_vlan=0xffff,
+                                dl_dst=vif_mac,
+                                actions="output:%s" %
+                                self.phys_loopback_ofports[physical_network])
+                    # Outgoing: allow legitimate IP packets
+                    br.add_flow(priority=20,
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=ip,
+                                actions="output:%s" %
+                                self.physical_network_ofport)
+                    # Outgoing: allow legitimate ARP response only
+                    br.add_flow(priority=20,
+                                proto='arp',
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=ip,
+                                actions="output:%s" %
+                                self.physical_network_ofport)
+                    # Outgoing: Drop spoofed IP packets
+                    br.add_flow(priority=10,
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=cidr,
+                                actions="drop")
+                    # Outgoing: Drop spoofed ARP packets
+                    br.add_flow(priority=10,
+                                proto='arp',
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=cidr,
+                                actions="drop")
+
+                    # For intergration bridge
+                    # Outgoing: allow legitimate IP packets
+                    self.int_br.add_flow(priority=40,
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=ip,
+                                actions="output:%s" % ofport)
+                    # Outgoing: allow legitimate ARP response only
+                    self.int_br.add_flow(priority=40,
+                                proto='arp',
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=ip,
+                                actions="output:%s" % ofport)
+                    # Outgoing: Drop spoofed IP internal packets
+                    self.int_br.add_flow(priority=30,
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=cidr,
+                                actions="drop")
+                    # Outgoing: Drop spoofed ARP internal packets
+                    self.int_br.add_flow(priority=30,
+                                proto='arp',
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=cidr,
+                                actions="drop")
+                # Anti_IP_spoofing
+                for ip, cidr in map(None, match_ip_list, match_cidr_list):
+
+                    # For physical bridge
+                    # Internal: ARP query packets
+                    br.add_flow(priority=40,
+                                in_port=self.phys_ofports[physical_network],
+                                proto='arp',
+                                nw_dst=ip,
+                                dl_dst="01:00:00:00:00:00/01:00:00:00:00:00",
+                                actions="output:%s" %
+                                self.phys_loopback_ofports[physical_network])
+                    # Internal: Destination-MAC for internal traffic
+                    br.add_flow(priority=30,
+                                in_port=self.phys_ofports[physical_network],
+                                dl_vlan=0xffff,
+                                dl_dst=vif_mac,
+                                actions="output:%s" %
+                                self.phys_loopback_ofports[physical_network])
+                    # Outgoing: allow legitimate IP packets
+                    br.add_flow(priority=20,
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=ip,
+                                actions="output:%s" %
+                                self.physical_network_ofport)
+                    # Outgoing: allow legitimate ARP response only
+                    br.add_flow(priority=20,
+                                proto='arp',
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=ip,
+                                actions="output:%s" %
+                                self.physical_network_ofport)
+                    # Outgoing: Drop spoofed IP packets
+                    br.add_flow(priority=10,
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=cidr,
+                                actions="drop")
+                    # Outgoing: Drop spoofed ARP packets
+                    br.add_flow(priority=10,
+                                proto='arp',
+                                in_port=self.phys_ofports[physical_network],
+                                nw_src=cidr,
+                                actions="drop")
+
+                    # For intergration bridge
+                    # Outgoing: allow legitimate IP packets
+                    self.int_br.add_flow(priority=40,
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=ip,
+                                actions="output:%s" % ofport)
+                    # Outgoing: allow legitimate ARP response only
+                    self.int_br.add_flow(priority=40,
+                                proto='arp',
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=ip,
+                                actions="output:%s" % ofport)
+                    # Outgoing: Drop spoofed IP internal packets
+                    self.int_br.add_flow(priority=30,
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=cidr,
+                                actions="drop")
+                    # Outgoing: Drop spoofed ARP internal packets
+                    self.int_br.add_flow(priority=30,
+                                proto='arp',
+                                in_port=
+                                self.int_loopback_ofports[physical_network],
+                                nw_dst=cidr,
+                                actions="drop")
+            else:
+                LOG.error("No MAC address given...port=%s", port_name)
+                return
+
     def provision_local_vlan(self, net_uuid, network_type, physical_network,
                              segmentation_id):
         '''Provisions a local VLAN.
@@ -274,16 +677,36 @@ class OVSQuantumAgent(object):
             if physical_network in self.phys_brs:
                 # outbound
                 br = self.phys_brs[physical_network]
-                br.add_flow(priority=4,
+                br.add_flow(priority=5,
                             in_port=self.phys_ofports[physical_network],
                             dl_vlan=lvid,
                             actions="strip_vlan,normal")
                 # inbound
-                self.int_br.add_flow(priority=3,
+                self.int_br.add_flow(priority=4,
                                      in_port=
                                      self.int_ofports[physical_network],
                                      dl_vlan=0xffff,
                                      actions="mod_vlan_vid:%s,normal" % lvid)
+
+                # For metadata service: BH
+                # outbound at phys_ofports
+                br.add_flow(priority=7,
+                            in_port=self.phys_ofports[physical_network],
+                            dl_vlan=lvid,
+                            nw_dst="169.254.169.254",
+                            actions="strip_vlan,mod_nw_dst:%s,"
+                                    "mod_tp_dst:8775,normal" % self.metadata_server_ip)
+
+                # inbound at br-int
+                self.int_br.add_flow(priority=7,
+                                     in_port=
+                                     self.int_ofports[physical_network],
+                                     nw_src=self.metadata_server_ip,
+                                     tp_src=8775,
+                                     actions="mod_nw_src:169.254.169.254,"
+                                             "mod_tp_src:80,mod_vlan_vid:%d,normal"
+                                             % lvid)
+
             else:
                 LOG.error("Cannot provision flat network for net-id=%s "
                           "- no bridge for physical_network %s", net_uuid,
@@ -332,10 +755,23 @@ class OVSQuantumAgent(object):
                 br.delete_flows(in_port=self.phys_ofports[lvm.
                                                           physical_network],
                                 dl_vlan=lvm.vlan)
+
+                # outbound at phys_ofports
+                br.delete_flows(in_port=self.phys_ofports[lvm.
+                                                          physical_network],
+                                dl_vlan=lvm.vlan,
+                                nw_dst="169.254.169.254")
+
                 # inbound
                 br = self.int_br
                 br.delete_flows(in_port=self.int_ofports[lvm.physical_network],
                                 dl_vlan=0xffff)
+
+                # inbound at br-int
+                br.delete_flows(in_port=self.int_ofports[lvm.physical_network],
+                                nw_src=self.metadata_server_ip,
+                                tp_src=8775)
+
         elif lvm.network_type == constants.TYPE_VLAN:
             if lvm.physical_network in self.phys_brs:
                 # outbound
@@ -357,8 +793,18 @@ class OVSQuantumAgent(object):
         del self.local_vlan_map[net_uuid]
         self.available_local_vlans.add(lvm.vlan)
 
-    def port_bound(self, port, net_uuid,
-                   network_type, physical_network, segmentation_id):
+    def port_bound(self, port, net_uuid, network_type, physical_network,
+                   segmentation_id, changed_port=None):
+
+        if cfg.CONF.AGENT.BH_ovs_flows:
+            self.port_bound_vps(port, net_uuid, network_type,
+                           physical_network, segmentation_id, changed_port)
+        else:
+            self.port_bound_org(port, net_uuid, network_type,
+                           physical_network, segmentation_id)
+
+    def port_bound_vps(self, port, net_uuid, network_type, physical_network,
+                       segmentation_id, changed_port):
         '''Bind port to net_uuid/lsw_id and install flow for inbound traffic
         to vm.
 
@@ -368,13 +814,57 @@ class OVSQuantumAgent(object):
         :param physical_network: the physical network for 'vlan' or 'flat'
         :param segmentation_id: the VID for 'vlan' or tunnel ID for 'tunnel'
         '''
+
+        if not self.available_local_vlans:
+            LOG.error("No local VLAN available for net-id=%s", net_uuid)
+            return
+        lvid = self.available_local_vlans.pop()
+        LOG.info("Assigning %s as local vlan for net-id=%s", lvid, net_uuid)
+        self.local_vlan_map[net_uuid] = LocalVLANMapping(lvid, network_type,
+                                                         physical_network,
+                                                         segmentation_id)
+
+        self.int_br.set_db_attribute("Port", port.port_name, "tag", '0')
+        # ovs-vsctl remove Interface tapc2d85045-cb external-ids 'vlan-tag'
+        self.int_br.remove_db_attribute("Interface", port.port_name, "vlan-tag")
+
+        if network_type == constants.TYPE_FLAT:
+            self.deploy_BH_ovs_flows(net_uuid, physical_network, port,
+                                      changed_port)
+        elif network_type == constants.TYPE_GRE:
+            if self.enable_tunneling:
+                # inbound unicast
+                self.tun_br.add_flow(priority=3, tun_id=segmentation_id,
+                                     dl_dst=port.vif_mac,
+                                     actions="mod_vlan_vid:%s,normal" %
+                                     lvm.vlan)
+
+        #if int(port.ofport) != -1:
+        #    self.int_br.delete_flows(in_port=port.ofport)
+
+    def port_bound_org(self, port, net_uuid, network_type,
+                       physical_network, segmentation_id):
+        '''Bind port to net_uuid/lsw_id and install flow for inbound traffic
+        to vm.
+
+        :param port: a ovslib.VifPort object.
+        :param net_uuid: the net_uuid this port is to be associated with.
+        :param network_type: the network type ('gre', 'vlan', 'flat', 'local')
+        :param physical_network: the physical network for 'vlan' or 'flat'
+        :param segmentation_id: the VID for 'vlan' or tunnel ID for 'tunnel'
+        '''
+
         if net_uuid not in self.local_vlan_map:
             self.provision_local_vlan(net_uuid, network_type,
                                       physical_network, segmentation_id)
+
         lvm = self.local_vlan_map[net_uuid]
         lvm.vif_ports[port.vif_id] = port
 
-        if network_type == constants.TYPE_GRE:
+        if network_type == constants.TYPE_FLAT:
+            self.update_flat_port_org(net_uuid, physical_network, lvm.vlan,
+                                      port)
+        elif network_type == constants.TYPE_GRE:
             if self.enable_tunneling:
                 # inbound unicast
                 self.tun_br.add_flow(priority=3, tun_id=segmentation_id,
@@ -383,6 +873,8 @@ class OVSQuantumAgent(object):
                                      lvm.vlan)
 
         self.int_br.set_db_attribute("Port", port.port_name, "tag",
+                                     str(lvm.vlan))
+        self.int_br.add_port_attribute("Interface", port.port_name, "vlan-tag",
                                      str(lvm.vlan))
         if int(port.ofport) != -1:
             self.int_br.delete_flows(in_port=port.ofport)
@@ -416,6 +908,87 @@ class OVSQuantumAgent(object):
 
         if not lvm.vif_ports:
             self.reclaim_local_vlan(net_uuid, lvm)
+        #else:
+        #    self.remove_flows(net_uuid, lvm)
+
+    def remove_flows(self, port, physical_network):
+        '''Updates a port in flat networks.
+        :param net_uuid: the uuid of the network associated with this vlan.
+        :param physical_network: only for 'flat' for now.
+        '''
+
+        ip_list = port['ip_list'].split(',')
+        cidr_list = port['cidr_list'].split(',')
+        vif_mac = port['vif_mac']
+
+        if physical_network in self.phys_brs:
+            br = self.phys_brs[physical_network]
+
+            self.int_br.delete_flows(in_port=
+                            self.int_ofports[physical_network],
+                            dl_vlan=0xffff,
+                            dl_dst=vif_mac)
+            self.int_br.delete_flows(in_port=
+                            self.int_loopback_ofports[physical_network],
+                            dl_vlan=0xffff,
+                            dl_dst=vif_mac)
+            br.delete_flows(in_port=
+                            self.phys_ofports[physical_network],
+                            dl_vlan=0xffff,
+                            dl_dst=vif_mac)
+
+            for ip, cidr in map(None, ip_list, cidr_list):
+                br.delete_flows(in_port=self.phys_ofports[physical_network],
+                            nw_src=ip)
+                br.delete_flows(proto='arp',
+                            in_port=self.phys_ofports[physical_network],
+                            nw_src=ip)
+                br.delete_flows(in_port=self.phys_ofports[physical_network],
+                            proto='arp',
+                            nw_dst=ip,
+                            dl_dst="01:00:00:00:00:00/01:00:00:00:00:00")
+                self.int_br.delete_flows(
+                            in_port=
+                            self.int_ofports[physical_network],
+                            proto='arp',
+                            nw_dst=ip,
+                            dl_dst=
+                            "01:00:00:00:00:00/01:00:00:00:00:00")
+                self.int_br.delete_flows(
+                            in_port=
+                            self.int_loopback_ofports[physical_network],
+                            proto='arp',
+                            nw_dst=ip,
+                            dl_dst=
+                            "01:00:00:00:00:00/01:00:00:00:00:00")
+                # Delete previously legitimate IP packets
+                self.int_br.delete_flows(
+                            in_port=
+                            self.int_loopback_ofports[physical_network],
+                            nw_dst=ip)
+                # Delete previously legitimate ARP response
+                self.int_br.delete_flows(
+                            proto='arp',
+                            in_port=
+                            self.int_loopback_ofports[physical_network],
+                            nw_dst=ip)
+                #
+                # Two reasons for not deleting cidr-based OVS flows.
+                # 1. There is a bug in OVS in deleteing arp-based flows.
+                #    For now, just leave it there, no harmful effect.
+                # 2. When other IPs exist in the same subnet, we shoul keep
+                #    the same cidr-based OVS flows for anti-IP spoofing.
+                # 3. An ideal solution would be like this:
+                #    Properly delete cidr-based OVS flows only when
+                #    those need to be deleted, i.e., when no other IPs exist
+                #    in the same subnet.
+                #
+                #br.delete_flows(proto='ip',
+                #            in_port=self.phys_ofports[physical_network],
+                #            nw_src=cidr)
+                #br.delete_flows(proto='arp',
+                #            in_port=self.phys_ofports[physical_network],
+                #            nw_src=cidr)
 
     def port_dead(self, port):
         '''Once a port has no binding, put it on the "dead vlan".
@@ -469,6 +1042,11 @@ class OVSQuantumAgent(object):
         self.phys_brs = {}
         self.int_ofports = {}
         self.phys_ofports = {}
+        self.int_loopback_ofports = {}
+        self.phys_loopback_ofports = {}
+        self.physical_network_ofport = None
+        self.br = {}
+
         ip_wrapper = ip_lib.IPWrapper(self.root_helper)
         for physical_network, bridge in bridge_mappings.iteritems():
             # setup physical bridge
@@ -478,6 +1056,7 @@ class OVSQuantumAgent(object):
                           bridge, physical_network)
                 sys.exit(1)
             br = ovs_lib.OVSBridge(bridge, self.root_helper)
+            self.br[br.br_name] = br
             br.remove_all_flows()
             br.add_flow(priority=1, actions="normal")
             self.phys_brs[physical_network] = br
@@ -487,12 +1066,50 @@ class OVSQuantumAgent(object):
             self.int_br.delete_port(int_veth_name)
             phys_veth_name = constants.VETH_PHYSICAL_PREFIX + bridge
             br.delete_port(phys_veth_name)
+
             if ip_lib.device_exists(int_veth_name, self.root_helper):
                 ip_lib.IPDevice(int_veth_name, self.root_helper).link.delete()
             int_veth, phys_veth = ip_wrapper.add_veth(int_veth_name,
                                                       phys_veth_name)
             self.int_ofports[physical_network] = self.int_br.add_port(int_veth)
             self.phys_ofports[physical_network] = br.add_port(phys_veth)
+            self.physical_network_ofport = br.get_port_ofport(physical_network)
+
+
+            # BH HACK: This enables to pass through int-br-eth0 for
+            # all inter-traffic among instances within the same host.
+            # This is necessary for dealing with public IPs that operate
+            # on different tags.
+            #
+            #                        veth (patched)
+            # tap1    int-br-eth0   <------------->  phy-br-eth0
+            # (tag:0)        /       direction: <==> (where dest-MAC filtering
+            #    \      ----/                         for lookback)
+            #     \    /                               |
+            #     br-int                            br-eth0 -- eth0
+            #     /    \                               |
+            #    /      ----\                          |
+            #   /            \       veth (patched)    |
+            # tap2    'int-lookback' <-------------> 'phy-lookback'
+            # (tag:0) (where dest-  direction: <== only
+            #          MAC filtering
+            #          for each tap)
+
+            int_loopback_name = constants.VETH_INTEGRATION_PREFIX + 'loopback'
+            self.int_br.delete_port(int_loopback_name)
+            phys_loopback_name = constants.VETH_PHYSICAL_PREFIX + 'loopback'
+            br.delete_port(phys_loopback_name)
+
+            if ip_lib.device_exists(int_loopback_name, self.root_helper):
+                ip_lib.IPDevice(int_loopback_name, self.root_helper).\
+                                link.delete()
+            int_loopback, phys_loopback = \
+                ip_wrapper.add_veth(int_loopback_name, phys_loopback_name)
+            self.int_loopback_ofports[physical_network] = \
+                self.int_br.add_port(int_loopback)
+            self.phys_loopback_ofports[physical_network] = \
+                br.add_port(phys_loopback)
+
 
             # block all untranslated traffic over veth between bridges
             self.int_br.add_flow(priority=2,
@@ -501,10 +1118,23 @@ class OVSQuantumAgent(object):
             br.add_flow(priority=2,
                         in_port=self.phys_ofports[physical_network],
                         actions="drop")
+            # block all untranslated traffic over veth between bridges
+            self.int_br.add_flow(priority=2,
+                                 in_port=
+                                 self.int_loopback_ofports[physical_network],
+                                 actions="drop")
 
             # enable veth to pass traffic
             int_veth.link.set_up()
             phys_veth.link.set_up()
+
+            # br_mtu: 1504 needed for OVS tag.
+            int_veth.link.set_mtu(self.br_mtu)
+            phys_veth.link.set_mtu(self.br_mtu)
+
+            # enable veth to pass traffic for loopback
+            int_loopback.link.set_up()
+            phys_loopback.link.set_up()
 
     def manage_tunnels(self, tunnel_ips, old_tunnel_ips, db):
         if self.local_ip in tunnel_ips:
@@ -650,35 +1280,87 @@ class OVSQuantumAgent(object):
                 LOG.exception("Main-loop Exception:")
                 self.rollback_until_success(db)
 
+    def update_current_ports(self, port_info):
+        """
+        Reflect any update from port_info['added'] to port_info['current']
+        """
+
+        for port in port_info['added']:
+            added_id = port['port_id']
+            matchport = filter(lambda port:port['port_id']==added_id,
+                               port_info['current'])
+            if matchport:
+                port_info['current'].remove(matchport[0])
+                port_info['current'].append(port)
+        return port_info['current']
+
     def update_ports(self, registered_ports):
-        ports = self.int_br.get_vif_port_set()
-        if ports == registered_ports:
+        new_ports = self.int_br.get_vif_port_set_with_tag()
+        if new_ports == registered_ports:
             return
-        added = ports - registered_ports
-        removed = registered_ports - ports
-        return {'current': ports,
-                'added': added,
-                'removed': removed}
+
+        added_ports = []
+        current_ports = new_ports
+        removed_ports = []
+        updated_ports = []
+
+        # New semantics of 'added_ports':
+        # not only new devices, but also any updated devices
+        # (e.g., ip_list change, done by nova-compute)
+        # Now 'added_ports' includes any updated ones.
+
+        for port in registered_ports:
+            reg_id = port['port_id']
+            matchport = filter(lambda port:port['port_id']==reg_id, new_ports)
+            if matchport:
+                if port != matchport[0]:
+                    added_ports.append(matchport[0])
+                    updated_ports.append((port,matchport[0]))
+            else:
+                removed_ports.append(port)
+
+        for port in new_ports:
+            new_id = port['port_id']
+            matchport = filter(lambda aPort:aPort['port_id']==new_id,
+                               registered_ports)
+            if matchport:
+                continue
+
+            matchport = filter(lambda aPort:aPort['port_id']==new_id,
+                               added_ports)
+            if not matchport:
+                updated_ports.append((None,port))
+
+        return {'current': current_ports,
+                'added': updated_ports,
+                'removed': removed_ports}
 
     def treat_vif_port(self, vif_port, port_id, network_id, network_type,
-                       physical_network, segmentation_id, admin_state_up):
+                       physical_network, segmentation_id,
+                       admin_state_up, changed_port=None):
         if vif_port:
             if admin_state_up:
                 self.port_bound(vif_port, network_id, network_type,
-                                physical_network, segmentation_id)
+                                physical_network, segmentation_id, changed_port)
             else:
                 self.port_dead(vif_port)
         else:
             LOG.debug("No VIF port for port %s defined on agent.", port_id)
 
-    def treat_devices_added(self, devices):
+    def treat_devices_added(self, port_info):
         resync = False
-        for device in devices:
+        new_devices = port_info['added']
+        old_devices = port_info['current']
+
+        for changed_port in new_devices:
+            each_port = changed_port[1]
+            device = each_port['port_id']
             LOG.info("Port %s added", device)
             try:
                 details = self.plugin_rpc.get_device_details(self.context,
                                                              device,
                                                              self.agent_id)
+                LOG.debug("PORT details of %s:%s", device, details)
             except Exception as e:
                 LOG.debug("Unable to get port details for %s: %s", device, e)
                 resync = True
@@ -691,39 +1373,52 @@ class OVSQuantumAgent(object):
                                     details['network_type'],
                                     details['physical_network'],
                                     details['segmentation_id'],
-                                    details['admin_state_up'])
+                                    details['admin_state_up'], changed_port)
+                # Once a VLAN is assigned from treat_vif_port(), use it to
+                # set up the value of the 'devices' dictionary.
+                if not cfg.CONF.AGENT.BH_ovs_flows:
+                    each_port['vlan_tag'] = \
+                        str(self.local_vlan_map[details['network_id']].vlan)
             else:
                 LOG.debug("Device %s not defined on plugin", device)
                 if (port and int(port.ofport) != -1):
                     self.port_dead(port)
         return resync
 
-    def treat_devices_removed(self, devices):
+    def treat_devices_removed(self, port_info):
         resync = False
-        for device in devices:
-            LOG.info("Attachment %s removed", device)
+        old_devices = port_info['current']
+        removed_devices = port_info['removed']
+
+        for each_port in removed_devices:
+            device = each_port['port_id']
             try:
-                details = self.plugin_rpc.update_device_down(self.context,
+                details = self.plugin_rpc.get_device_details(self.context,
                                                              device,
                                                              self.agent_id)
+                LOG.debug("PORT details of %s:%s", device, details)
             except Exception as e:
-                LOG.debug("port_removed failed for %s: %s", device, e)
+                LOG.debug("Unable to get port details for %s: %s", device, e)
                 resync = True
-            if details['exists']:
-                LOG.info("Port %s updated.", device)
-                # Nothing to do regarding local networking
+                continue
+            if 'port_id' in details:
+                LOG.info("Port %s updated. Details: %s", device, details)
+                self.remove_flows(each_port, details['physical_network'])
             else:
                 LOG.debug("Device %s not defined on plugin", device)
-                self.port_unbound(device)
+                if (port and int(port.ofport) != -1):
+                    self.port_dead(port)
         return resync
 
     def process_network_ports(self, port_info):
         resync_a = False
         resync_b = False
+
         if 'added' in port_info:
-            resync_a = self.treat_devices_added(port_info['added'])
+            resync_a = self.treat_devices_added(port_info)
         if 'removed' in port_info:
-            resync_b = self.treat_devices_removed(port_info['removed'])
+            resync_b = self.treat_devices_removed(port_info)
+
         # If one of the above opertaions fails => resync with plugin
         return (resync_a | resync_b)
 
@@ -743,7 +1438,7 @@ class OVSQuantumAgent(object):
 
     def rpc_loop(self):
         sync = True
-        ports = set()
+        ports = {}
         tunnel_sync = True
 
         while True:
@@ -751,7 +1446,7 @@ class OVSQuantumAgent(object):
                 start = time.time()
                 if sync:
                     LOG.info("Agent out of sync with plugin!")
-                    ports.clear()
+                    ports = {}
                     sync = False
 
                 # Notify the plugin of tunnel IP
@@ -760,12 +1455,15 @@ class OVSQuantumAgent(object):
                     tunnel_sync = self.tunnel_sync()
 
                 port_info = self.update_ports(ports)
+                LOG.info("PORT INFO=%s" % port_info)
+                LOG.info("Current ports=%s" % ports)
 
                 # notify plugin about port deltas
-                if port_info:
-                    LOG.debug("Agent loop has new devices!")
+                if port_info is not None:
+                    LOG.debug("Agent loop has updated devices!")
                     # If treat devices fails - must resync with plugin
                     sync = self.process_network_ports(port_info)
+                    #ports = self.update_current_ports(port_info)
                     ports = port_info['current']
 
             except:
@@ -817,9 +1515,27 @@ def main():
         sys.exit(1)
     LOG.info(_("Bridge mappings: %s") % bridge_mappings)
 
+    # metadata service
+    metadata_server_ip = cfg.CONF.OVS.metadata_server_ip
+    br_mtu = cfg.CONF.OVS.br_mtu
+
+    bridge_mappings = {}
+    for mapping in cfg.CONF.OVS.bridge_mappings:
+        mapping = mapping.strip()
+        if mapping != '':
+            try:
+                physical_network, bridge = mapping.split(':')
+                bridge_mappings[physical_network] = bridge
+                LOG.info("Physical network %s mapped to bridge %s",
+                         physical_network, bridge)
+            except ValueError as ex:
+                LOG.error("Invalid bridge mapping: \'%s\' - %s", mapping, ex)
+                sys.exit(1)
+
     plugin = OVSQuantumAgent(integ_br, tun_br, local_ip, bridge_mappings,
                              root_helper, polling_interval,
-                             reconnect_interval, rpc, enable_tunneling)
+                             reconnect_interval, rpc, enable_tunneling,
+                             metadata_server_ip, br_mtu)
 
     # Start everything.
     LOG.info("Agent initialized successfully, now running... ")

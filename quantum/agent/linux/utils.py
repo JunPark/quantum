@@ -64,7 +64,6 @@ def execute(cmd, root_helper=None, process_input=None, addl_env=None,
 
     return return_stderr and (_stdout, _stderr) or _stdout
 
-
 def get_interface_mac(interface):
     DEVICE_NAME_LEN = 15
     MAC_START = 18

@@ -73,6 +73,7 @@ class OVSRpcCallbacks(dhcp_rpc_base.DhcpRpcCallbackMixin):
             binding = ovs_db_v2.get_network_binding(None, port['network_id'])
             entry = {'device': device,
                      'network_id': port['network_id'],
+                     'vm_uuid': port['device_id'],
                      'port_id': port['id'],
                      'admin_state_up': port['admin_state_up'],
                      'network_type': binding.network_type,
@@ -96,7 +97,9 @@ class OVSRpcCallbacks(dhcp_rpc_base.DhcpRpcCallbackMixin):
             entry = {'device': device,
                      'exists': True}
             # Set port status to DOWN
-            ovs_db_v2.set_port_status(port['id'], q_const.PORT_STATUS_DOWN)
+            # BH HACK: we do not switch to DOWN
+            # ovs_db_v2.set_port_status(port['id'], q_const.PORT_STATUS_DOWN)
+            LOG.info("BH HACK: Port %s is not updated to DOWN.", device)
         else:
             entry = {'device': device,
                      'exists': False}
