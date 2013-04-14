@@ -27,19 +27,24 @@ LOG = logging.getLogger(__name__)
 
 
 class VifPort:
-    def __init__(self, port_name, ofport, vif_id, vif_mac, switch):
+    def __init__(self, port_name, ofport, vif_id, vif_mac, switch,
+                 vlan_tag=None, ip_list=None, cidr_list=None):
         self.port_name = port_name
         self.ofport = ofport
         self.vif_id = vif_id
         self.vif_mac = vif_mac
         self.switch = switch
+        self.vlan_tag = vlan_tag
+        self.ip_list = ip_list
+        self.cidr_list = cidr_list
 
     def __str__(self):
         return ("iface-id=" + self.vif_id + ", vif_mac=" +
                 self.vif_mac + ", port_name=" + self.port_name +
                 ", ofport=" + str(self.ofport) + ", bridge_name =" +
-                self.switch.br_name)
-
+                self.switch.br_name + ", vlan_tag=" + self.vlan_tag +
+                ", ip_list=" + str(self.ip_list) + ", cidr_list=" +
+                self.cidr_list)
 
 class OVSBridge:
     def __init__(self, br_name, root_helper):
@@ -53,8 +58,11 @@ class OVSBridge:
         iface = 'iface-id="(?P<vif_id>[^"]+)"'
         name = 'name\s*:\s"(?P<port_name>[^"]*)"'
         port = 'ofport\s*:\s(?P<ofport>-?\d+)'
-        _re = ('%(external)s:\s{ ( %(mac)s,? | %(iface)s,? | . )* }'
-               ' \s+ %(name)s \s+ %(port)s' % locals())
+        iplist = 'ip-list="(?P<ip_list>[^"]*)"'
+        cidrlist = 'cidr-list="(?P<cidr_list>[^"]*)"'
+        _re = ('%(external)s:\s{ ( %(mac)s,? | %(iface)s,? | %(iplist)s,?'
+               ' | %(cidrlist)s,? | . )* } \s+ %(name)s \s+ %(port)s' %
+               locals())
         return re.compile(_re, re.M | re.X)
 
     def run_vsctl(self, args):
@@ -83,6 +91,10 @@ class OVSBridge:
 
     def clear_db_attribute(self, table_name, record, column):
         args = ["clear", table_name, record, column]
+        self.run_vsctl(args)
+
+    def remove_db_attribute(self, table_name, dev, field):
+        args = ["remove", table_name, dev, "external-ids", field]
         self.run_vsctl(args)
 
     def run_ofctl(self, cmd, args):
@@ -130,7 +142,10 @@ class OVSBridge:
         nw_dst = 'nw_dst' in kwargs and ",nw_dst=%s" % kwargs['nw_dst'] or ''
         tun_id = 'tun_id' in kwargs and ",tun_id=%s" % kwargs['tun_id'] or ''
         proto = 'proto' in kwargs and ",%s" % kwargs['proto'] or ''
-        ip = ('nw_src' in kwargs or 'nw_dst' in kwargs) and ',ip' or ''
+        if not proto:
+            ip = ('nw_src' in kwargs or 'nw_dst' in kwargs) and ',ip' or ''
+        else:
+            ip = ''
         match = (in_port + dl_type + dl_vlan + dl_src + dl_dst +
                 (ip or proto) + nw_src + nw_dst + tun_id)
         if match:
@@ -220,7 +235,13 @@ class OVSBridge:
         for name in port_names:
             external_ids = self.db_get_map("Interface", name, "external_ids")
             ofport = self.db_get_val("Interface", name, "ofport")
-            if "iface-id" in external_ids and "attached-mac" in external_ids:
+            if "iface-id" in external_ids and "attached-mac" in external_ids \
+                and "vlan-tag" in external_ids:
+                p = VifPort(name, ofport, external_ids["iface-id"],
+                            external_ids["attached-mac"], self,
+                            vlan_tag=external_ids["vlan-tag"])
+                edge_ports.append(p)
+            elif "iface-id" in external_ids and "attached-mac" in external_ids:
                 p = VifPort(name, ofport, external_ids["iface-id"],
                             external_ids["attached-mac"], self)
                 edge_ports.append(p)
@@ -232,6 +253,56 @@ class OVSBridge:
                 p = VifPort(name, ofport, iface_id,
                             external_ids["attached-mac"], self)
                 edge_ports.append(p)
+
+        return edge_ports
+
+    def add_db_attribute(self, table_name, dev, field, value):
+        args = ['add', table_name, dev,
+                'external-ids', '%s=%s' % (field, value)]
+        result = self.run_vsctl(args)
+        return result
+
+    def add_port_attribute(self, table_name, port_name, field, value):
+        self.add_db_attribute(table_name, port_name, field, value)
+
+    def get_vif_port_set_with_tag(self):
+        edge_ports = []
+        port_names = self.get_port_name_list()
+        for name in port_names:
+            port = {}
+            external_ids = self.db_get_map("Interface", name, "external_ids")
+            if "iface-id" in external_ids and "attached-mac" in external_ids \
+                and "ip-list" in external_ids and "cidr-list" in external_ids \
+                and "vm-uuid" in external_ids:
+                port['port_id'] = external_ids['iface-id']
+                if "vlan-tag" in external_ids:
+                    port['vlan_tag'] = external_ids['vlan-tag']
+                else:
+                    port['vlan_tag'] = None
+                port['ip_list'] = external_ids['ip-list']
+                port['cidr_list'] = external_ids['cidr-list']
+                if "vm-uuid" in external_ids:
+                    port['vm_uuid'] = external_ids['vm-uuid']
+                else:
+                    port['vm_uuid'] = None
+                port['vif_mac'] = external_ids['attached-mac']
+                port['status'] = external_ids['iface-status']
+                edge_ports.append(port)
+            elif "iface-id" in external_ids and "attached-mac" in external_ids:
+                port['port_id'] = external_ids['iface-id']
+                port['vlan_tag'] = None
+                edge_ports.append(port)
+            elif ("xs-vif-uuid" in external_ids and
+                  "attached-mac" in external_ids):
+                # if this is a xenserver and iface-id is not automatically
+                # synced to OVS from XAPI, we grab it from XAPI directly
+                iface_id = self.get_xapi_iface_id(external_ids["xs-vif-uuid"])
+                port['port_id'] = None
+                edge_ports.append(port)
+
+            if "update" in external_ids:
+                port['update'] = external_ids['update']
+                edge_ports.append(port)
 
         return edge_ports
 
@@ -263,7 +334,11 @@ class OVSBridge:
             vif_id = match.group('vif_id')
             port_name = match.group('port_name')
             ofport = int(match.group('ofport'))
-            return VifPort(port_name, ofport, vif_id, vif_mac, self)
+            iplist = match.group('ip_list')
+            cidrlist = match.group('cidr_list')
+
+            return VifPort(port_name, ofport, vif_id, vif_mac, self,
+                           ip_list=iplist, cidr_list=cidrlist)
         except Exception, e:
             LOG.info("Unable to parse regex results. Exception: %s", e)
             return

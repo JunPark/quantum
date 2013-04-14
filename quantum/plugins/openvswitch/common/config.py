@@ -31,7 +31,9 @@ ovs_opts = [
     cfg.StrOpt('integration_bridge', default='br-int'),
     cfg.BoolOpt('enable_tunneling', default=False),
     cfg.StrOpt('tunnel_bridge', default='br-tun'),
-    cfg.StrOpt('local_ip', default=''),
+    cfg.StrOpt('local_ip', default='127.0.0.1'),
+    cfg.StrOpt('metadata_server_ip', default='127.0.0.1'),
+    cfg.StrOpt('br_mtu', default=1500),
     cfg.ListOpt('bridge_mappings',
                 default=DEFAULT_BRIDGE_MAPPINGS,
                 help="List of <physical_network>:<bridge>"),
@@ -50,6 +52,8 @@ ovs_opts = [
 agent_opts = [
     cfg.IntOpt('polling_interval', default=2),
     cfg.StrOpt('root_helper', default='sudo'),
+    cfg.BoolOpt('BH_ovs_flows', default=False,
+                help="Use anti IP and ARP spoofing flows True or False"),
     cfg.BoolOpt('rpc', default=True),
 ]
 

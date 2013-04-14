@@ -422,7 +422,8 @@ RESOURCE_ATTRIBUTE_MAP = {
                       'validate': {'type:string': None},
                       'required_by_policy': True,
                       'is_visible': True},
-        'status': {'allow_post': False, 'allow_put': False,
+        'status': {'allow_post': True, 'allow_put': True,
+                   'default': 'ACTIVE',
                    'is_visible': True},
     },
     'subnets': {
