@@ -77,7 +77,9 @@ class APIRouter(wsgi.Router):
 
         resources = {'network': 'networks',
                      'subnet': 'subnets',
-                     'port': 'ports'}
+                     'port': 'ports',
+                     'instance_nw_info': 'instance_nw_infos'}
+
 
         def _map_resource(collection, resource, params):
             allow_bulk = cfg.CONF.allow_bulk
@@ -97,3 +99,4 @@ class APIRouter(wsgi.Router):
                               resources[resource], dict()))
 
         super(APIRouter, self).__init__(mapper)
+

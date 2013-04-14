@@ -20,6 +20,7 @@ import random
 import netaddr
 from sqlalchemy import orm
 from sqlalchemy.orm import exc
+from sqlalchemy.sql import and_, or_, not_
 
 from quantum.api.v2 import attributes
 from quantum.common import constants
@@ -885,6 +886,66 @@ class QuantumDbPluginV2(quantum_plugin_base_v2.QuantumPluginBaseV2):
                "device_owner": port["device_owner"]}
         return self._fields(res, fields)
 
+    def _make_instance_nw_info_dict(self, nw_info, fields=None):
+
+        # one_port='admin_state_up', 'device_id', 'device_owner', 'fixed_ips',
+        # 'get', 'id', 'iteritems', 'mac_address', 'metadata', 'name',
+        # 'network_id', 'networks', 'next', 'status', 'tenant_id', 'update
+        # one_network='admin_state_up', 'get', 'id', 'iteritems', 'metadata',
+        # 'name', 'next', 'ports', 'shared', 'status', 'subnets', 'tenant_id'
+
+        one_network = nw_info[0] # Network object
+        one_port = nw_info[1] # Port object
+
+        #(Pdb) one_network['subnets'][0]['gateway_ip']
+        #u'192.168.0.1'
+        #(Pdb) one_network['subnets'][1]['gateway_ip']
+        #u'69.195.65.1'
+
+        res = {'network':
+                    {
+                        'bridge': '',
+                        'subnets': [
+                              { 'ips':[{
+                                        'meta': {},
+                                        'version': subnet['ip_version'],
+                                        'type': 'fixed',
+                                        'floating_ips': [],
+                                        'address': ip_alloc['ip_address']
+                                       }
+                                       for ip_alloc in one_port.fixed_ips \
+                                       if ip_alloc['subnet_id'] == subnet['id']
+                                       # 'ip_address', 'iteritems', 'metadata',
+                                       # 'network_id', 'next', 'port_id',
+                                       # 'ports', 'subnet_id',
+                                 ],
+                                'version': 4,
+                                'meta': {},
+                                'dns': [],
+                                'routes': [],
+                                'cidr': subnet['cidr'],
+                                'gateway': {
+                                        'meta': {},
+                                        'version': subnet['ip_version'],
+                                        'type': 'gateway',
+                                        'address': subnet['gateway_ip'],
+                                }
+                              }
+                              for subnet in one_network['subnets']
+                        ],
+                        'meta': {'injected': False,
+                                 'tenant_id': one_network['tenant_id'],
+                                 'id': one_network['id'],
+                                 'label': one_network['name'],
+                                },
+                    },
+              'meta': {},
+              'id': one_port['id'],
+              'address': one_port['mac_address'],
+        }
+
+        return self._fields(res, fields)
+
     def _create_bulk(self, resource, context, request_items):
         objects = []
         collection = "%ss" % resource
@@ -1327,3 +1388,27 @@ class QuantumDbPluginV2(quantum_plugin_base_v2.QuantumPluginBaseV2):
 
     def get_ports_count(self, context, filters=None):
         return self._get_ports_query(context, filters).count()
+
+    def get_instance_nw_infos(self, context, filters=None, fields=None):
+        query = self._get_instance_nw_info_query(context,filters)
+
+        nw_list = []
+        for item in query.all():
+            nw_list.append(self._make_instance_nw_info_dict(item, fields))
+        return nw_list
+
+    def _get_instance_nw_info_query(self, context, filters=None):
+        Port = models_v2.Port
+        IPAllocation = models_v2.IPAllocation
+        Network = models_v2.Network
+
+        instance_id = str(filters.pop('device_id')[0])
+        tenant_id = str(filters.pop('tenant_id')[0])
+        q = context.session.query(Network,Port,IPAllocation)
+        q = q.filter(or_(Network.tenant_id == context.tenant_id,
+                        Network.shared == True))
+        q = q.filter(Port.device_id==instance_id)
+        q = q.join(Port, Port.network_id==Network.id)
+        q = q.join(IPAllocation, Port.id==IPAllocation.port_id)
+        q = q.group_by(Port.id)
+        return q

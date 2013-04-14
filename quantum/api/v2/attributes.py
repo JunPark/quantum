@@ -383,6 +383,33 @@ RESOURCE_ATTRIBUTE_MAP = {
                  'required_by_policy': True,
                  'enforce_policy': True},
     },
+
+
+    'instance_nw_infos': {
+        'network': {'allow_put': False,
+                    'validate': {'type:string': None},
+                    'is_visible': True},
+        'meta': {'allow_put': False, 'allow_put': False,
+                 'validate': {'type:string': None},
+                 'is_visible': True},
+        'id': {'allow_put': False, 'allow_put': False,
+               'validate': {'type:regex': UUID_PATTERN},
+               'is_visible': True},
+        'address': {'allow_put': False, 'allow_put': False,
+                    'default': ATTR_NOT_SPECIFIED,
+                    'validate': {'type:mac_address': None},
+                    'is_visible': True},
+        SHARED: {'allow_post': True,
+                 'allow_put': True,
+                 'default': False,
+                 'convert_to': convert_to_boolean,
+                 'validate': {'type:boolean': None},
+                 'is_visible': True,
+                 'required_by_policy': True,
+                 'enforce_policy': True},
+    },
+
+
     'ports': {
         'id': {'allow_post': False, 'allow_put': False,
                'validate': {'type:regex': UUID_PATTERN},
@@ -477,7 +504,7 @@ RESOURCE_ATTRIBUTE_MAP = {
                  'is_visible': False,
                  'required_by_policy': True,
                  'enforce_policy': True},
-    }
+    },
 }
 
 # Associates to each resource its own parent resource

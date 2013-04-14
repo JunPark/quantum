@@ -290,3 +290,8 @@ class QuantumPluginBaseV2(object):
         : param id: UUID representing the port to delete.
         """
         pass
+
+
+    @abstractmethod
+    def get_instance_nw_infos(self, context, filters=None, fields=None):
+        pass
