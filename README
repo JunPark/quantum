@@ -1,3 +1,38 @@
+
+This is an unofficial fork of Openstack/Folsom Quantum.
+
+The following are two main features added by EIG/Bluehost.
+
+1. New REST API: get_instance_nw_infos()
+
+In order to run this new API, you need to have other BH-Enhanced packages
+(e.g., BH-enhanced python-quantumclient and nova) that understand the new API.
+
+2. You need to add 'BH_ovs_flows = True' in [Agent] in 'ovs_quantum_plugin.ini.'
+
+[AGENT]
+BH_ovs_flows = True
+
+This design enables to pass through phy-br-eth0 where
+reverting back packets for all intra-traffic among instances
+within the same host. No tag on tap interfaces (i.e., tag:0).
+
+                         veth (patched)
+  tap1    int-br-eth0   <------------->  phy-br-eth0
+  (tag:0)        /       direction: <==> (where target-MAC filtering
+     \      ----/                         for lookback)
+      \    /                               |
+      br-int                            br-eth0 -- eth0
+      /    \                               |
+     /      ----\                          |
+    /            \       veth (patched)    |
+  tap2    'int-lookback' <-------------> 'phy-lookback'
+  (tag:0) (where target-  direction: <==
+           MAC filtering
+           for each tap)
+
+==========================================================================
+
 # -- Welcome!
 
   You have come across a cloud computing network fabric controller.  It has
